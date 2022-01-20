@@ -1,0 +1,230 @@
+pipeline {
+    agent any
+    options { 
+        buildDiscarder(logRotator(numToKeepStr: '100')) 
+    }
+    environment{
+        IMAGENAME = 'brunohigino/customnginx'
+        DOCKERLOGIN = ''
+        DOCKERPASSWORD = ''
+        BUILDNUM = '${env.BUILD_NUMBER}'
+        CONTAINERNAME = 'nginx_build'
+        PRODUSER = ''
+        PRODPASSWORD = ''
+        PRODIP = ''
+        PORTMAPPING = '3000:80'
+        def rollback = ''
+        def rootuser = 'root'
+        def lastfunctionalbuild = ''
+    }
+    stages {
+        stage('Build Docker Image') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    sh "docker build -t ${IMAGENAME}:latest ."
+                    sh "docker build -t ${IMAGENAME}:${env.BUILD_NUMBER} ."
+                }
+            }
+        }
+        stage('Push Docker Image') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    sh "docker login -u ${DOCKERLOGIN} -p ${DOCKERPASSWORD} docker.io"
+                    sh "docker push ${IMAGENAME}:${env.BUILD_NUMBER}"
+                    sh "docker push ${IMAGENAME}:latest"
+                }
+            }
+        }
+        stage('Removing old images from the worker') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    try{
+                        def oldimagerm = 2;
+                        def keep = (env.BUILD_NUMBER.toInteger()) - oldimagerm;
+                        sh "docker rmi ${IMAGENAME}:${keep}"
+                        echo "${Keep} build removed"
+                    }
+                    catch(Exception e){
+                        sh 'echo Image "${IMAGENAME}:${keep}" not found'
+                    }
+                }
+            }
+        }
+        stage('Pull New Image To Production Server') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    sh "sshpass -p ${PRODPASSWORD} -v ssh -o StrictHostKeyChecking=no ${rootuser}@${PRODIP} \"docker login -u ${DOCKERLOGIN} -p ${DOCKERPASSWORD} docker.io\""
+                    sh "sshpass -p ${PRODPASSWORD} -v ssh -o StrictHostKeyChecking=no ${rootuser}@${PRODIP} docker pull ${IMAGENAME}:${env.BUILD_NUMBER}"
+                }
+            }
+        }
+        stage('Deploy to Prodution') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    lastfunctionalbuild = input (
+                        message: "Whats is the last functional build?",
+                    parameters: [
+                        string(name: 'lastfunctionalbuild', description: 'Input only the number example: 236')
+                    ])
+                    try{
+                        echo "Stopping container ${CONTAINERNAME}_${lastfunctionalbuild}"
+                        sh "sshpass -p ${PRODPASSWORD} -v ssh -o StrictHostKeyChecking=no ${rootuser}@${PRODIP} docker stop ${CONTAINERNAME}_${lastfunctionalbuild}"
+                    }
+                    catch(Exception e){
+                        sh 'echo Container "${CONTAINERNAME}_${lastfunctionalbuild}" not found'
+                        
+                    }
+                    sh "sshpass -p ${PRODPASSWORD} -v ssh -o StrictHostKeyChecking=no ${rootuser}@${PRODIP} docker run -d --name ${CONTAINERNAME}_${env.BUILD_NUMBER} -p ${PORTMAPPING} ${IMAGENAME}:${env.BUILD_NUMBER}"
+                }
+            }
+        }
+        stage('Need Rollback?') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script{
+                    rollback = input (
+                        message: "Need Rollback? Yes or No",
+                    parameters: [
+                        string(name: 'rollback', defaultValue: 'No', description: 'Input Yes or No')
+                    ])
+                    if(rollback == 'No'){
+                        echo 'Start cleanning old build'
+                    }
+                    else{
+                        echo 'Starting rollback'
+                    }
+
+                }
+            }
+        }
+        stage('Removing Old Containers from the Prodution Server') {
+            when {
+                branch 'main'
+                expression{rollback =='No'}
+            }
+            steps {
+                script{
+                    echo 'Start removing old containers...'
+                    try{
+                        def rmcontainer = (env.BUILD_NUMBER.toInteger()) - 2;
+                        echo "Removing container ${CONTAINERNAME}_${rmcontainer}"
+                        sh "sshpass -p ${PRODPASSWORD} -v ssh -o StrictHostKeyChecking=no ${rootuser}@${PRODIP} docker rm -f ${CONTAINERNAME}_${rmcontainer}"
+                    }
+                    catch(Exception e){
+                        sh 'echo Container "${CONTAINERNAME}_${rmcontainer}" not found'
+
+                    }
+                }
+            }
+        }
+        stage('Removing Old Images from the Prod Server') {
+            when {
+                branch 'main'
+                expression{rollback =='No'}
+            }
+            steps {
+                script{
+                    echo 'Start cleanning old images...'
+                    try{
+                        def rmimage = (env.BUILD_NUMBER.toInteger()) - 2;
+                        echo "Removing container ${CONTAINERNAME}_${rmcontainer}"
+                        sh "sshpass -p ${PRODPASSWORD} -v ssh -o StrictHostKeyChecking=no ${rootuser}@${PRODIP} docker rmi -f ${IMAGENAME}:${rmimage}"
+                    }
+                    catch(Exception e){
+                        sh 'echo Image "${IMAGENAME}:${rmimage}" not found'
+
+                    }
+                }
+            }
+        }
+        stage('Stopping Current Build Container') {
+            when {
+                branch 'main'
+                expression{rollback !='No'}
+            }
+            steps {
+                script{
+                    echo 'Starting rollback...'
+                    try{
+                        echo "stopping container ${CONTAINERNAME}_${env.BUILD_NUMBER}"
+                        sh "sshpass -p ${PRODPASSWORD} -v ssh -o StrictHostKeyChecking=no ${rootuser}@${PRODIP} docker stop ${CONTAINERNAME}_${env.BUILD_NUMBER}"
+                    }
+                    catch(Exception e){
+                        sh "echo Container ${CONTAINERNAME}_${env.BUILD_NUMBER} not found"
+
+                    }
+                }
+            }
+        }
+        stage('Removing Current Build Container') {
+            when {
+                branch 'main'
+                expression{rollback !='No'}
+            }
+            steps {
+                script{
+                    try{
+                        echo "Removing container ${CONTAINERNAME}_${env.BUILD_NUMBER}"
+                        sh "sshpass -p ${PRODPASSWORD} -v ssh -o StrictHostKeyChecking=no ${rootuser}@${PRODIP} docker rm ${CONTAINERNAME}_${env.BUILD_NUMBER}"
+                    }
+                    catch(Exception e){
+                        sh 'echo Container "${CONTAINERNAME}_${env.BUILD_NUMBER}" not found'
+
+                    }
+                }
+            }
+        }
+        stage('Starting Container from the Previous Build') {
+            when {
+                branch 'main'
+                expression{rollback !='No'}
+            }
+            steps {
+                script{
+                    try{
+                        echo "Starting container ${CONTAINERNAME}_${lastfunctionalbuild}"
+                        sh "sshpass -p ${PRODPASSWORD} -v ssh -o StrictHostKeyChecking=no ${rootuser}@${PRODIP} docker start ${CONTAINERNAME}_${lastfunctionalbuild}"
+                    }
+                    catch(Exception e){
+                        sh 'echo Container "${CONTAINERNAME}_${lastfunctionalbuild}" not found'
+
+                    }
+                }
+            }
+        }        
+        stage('Removing Current Build Image') {
+            when {
+                branch 'main'
+                expression{rollback !='No'}
+            }
+            steps {
+                script{
+                    try{
+                        echo "stopping container ${IMAGENAME}:${env.BUILD_NUMBER}"
+                        sh "sshpass -p ${PRODPASSWORD} -v ssh -o StrictHostKeyChecking=no ${rootuser}@${PRODIP} docker rmi ${IMAGENAME}:${env.BUILD_NUMBER}"
+                    }
+                    catch(Exception e){
+                        sh 'echo Container "${IMAGENAME}:${env.BUILD_NUMBER}" not found'
+                    }
+                }
+            }
+        }                              
+    }
+}
